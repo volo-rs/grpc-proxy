@@ -6,12 +6,16 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.62"
 futures = "0.3.23"
 http = "0.2.8"
 hyper = { version = "0.14.20", features = ["full"] }
 index_list = "0.2.7"
 metainfo = "0.6.2"
 motore = "0.1.0"
+newtype = "0.2.1"
 tokio = { version = "1.20.1", features = ["sync", "net"] }
+tower = "0.4.13"
 tracing = "0.1.36"
-volo-grpc = { git = "https://github.com/cloudwego/volo.git", package = "volo-grpc" }
+volo = "0.1.0"
+volo-grpc = { git = "https://github.com/ethe/volo.git", package = "volo-grpc" }

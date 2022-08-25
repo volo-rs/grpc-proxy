@@ -2,13 +2,13 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     convert::Infallible,
     fmt,
+    future::Future,
     marker::PhantomData,
     pin::Pin,
     sync::{atomic::AtomicBool, Arc},
     time::{Duration, Instant},
 };
 
-use futures::Future;
 use index_list::{Index, IndexList};
 use motore::BoxError;
 use tokio::sync::Mutex;
