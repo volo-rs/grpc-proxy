@@ -16,6 +16,7 @@ motore = "0.1.0"
 newtype = "0.2.1"
 tokio = { version = "1.20.1", features = ["sync", "net"] }
 tower = "0.4.13"
+tower-layer = "0.3.1"
 tracing = "0.1.36"
-volo = "0.1.0"
-volo-grpc = { git = "https://github.com/ethe/volo.git", package = "volo-grpc" }
+volo = { git = "https://github.com/cloudwego/volo.git", package = "volo" }
+volo-grpc = { git = "https://github.com/cloudwego/volo.git", package = "volo-grpc" }

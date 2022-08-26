@@ -3,14 +3,11 @@
 
 pub mod connector;
 
-use std::{
-    cell::UnsafeCell, future::Future, marker::PhantomData, net::SocketAddr, sync::Arc,
-    time::Duration,
-};
+use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
 use connector::circuit_breaker::{DynCondition, Handler, InspectedFuture};
 pub use connector::*;
-use futures::TryStreamExt;
+use futures::{Future, TryStreamExt};
 use http::{uri::Authority, Request, Response, Uri};
 use hyper::Body;
 use metainfo::TypeMap;
@@ -20,20 +17,8 @@ use motore::{
     BoxCloneService, BoxError, Service,
 };
 use newtype::NewType;
-use volo::{
-    net::{conn::Conn, Address},
-    util::Ref,
-    Layer,
-};
-use volo_grpc::{
-    body::Body as GrpcBody,
-    codec::decode::Kind,
-    context::{Config, ServerContext},
-    request::Request as GrpcRequest,
-    response::Response as GrpcResponse,
-    status::Status as GrpcStatus,
-    RecvEntryMessage, SendEntryMessage,
-};
+use volo::{net::Address, util::Ref, Layer};
+use volo_grpc::context::ServerContext;
 
 pub type BoxFuture<T, E> = futures::future::BoxFuture<'static, Result<T, E>>;
 pub type ConnExtra = TypeMap;
@@ -88,275 +73,6 @@ pub struct ServiceName<'a>(pub Ref<'a, str>);
 #[derive(NewType, Clone, Debug)]
 pub struct RemoteAddr(pub SocketAddr);
 
-pub struct RedirectServer<C, L = Identity, P = Identity> {
-    connector: C,
-    proxy: P,
-    layer: L,
-}
-
-impl<C> RedirectServer<C> {
-    pub fn new(connector: C) -> Self {
-        Self {
-            connector,
-            proxy: Identity::new(),
-            layer: Identity::new(),
-        }
-    }
-}
-
-impl<C, L, P> RedirectServer<C, L, P> {
-    pub fn layer<NL>(self, layer: NL) -> RedirectServer<C, Stack<L, NL>, P> {
-        RedirectServer {
-            connector: self.connector,
-            proxy: self.proxy,
-            layer: Stack::new(self.layer, layer),
-        }
-    }
-
-    pub fn proxy<NP>(self, proxy: NP) -> RedirectServer<C, L, Stack<P, NP>> {
-        RedirectServer {
-            connector: self.connector,
-            proxy: Stack::new(self.proxy, proxy),
-            layer: self.layer,
-        }
-    }
-
-    // pub fn layer_fn<M, F, Fut>(self, f: F) -> RedirectServer<C, Stack<L, LayerFn<F>>, P>
-    // where
-    //     F: Fn(
-    //             (GrpcRequest<M>, Arc<ConnExtra>),
-    //             BoxCloneService<(GrpcRequest, Arc<ConnExtra>), GrpcResponse<GrpcBody>,
-    // GrpcStatus>,         ) -> Fut
-    //         + Clone,
-    //     Fut: Future<Output = Result<GrpcResponse<GrpcBody>, GrpcStatus>>,
-    // {
-    //     self.layer(layer_fn(f))
-    // }
-
-    pub async fn run_with_circuit_breaker<T, U, A: volo::net::MakeIncoming, Cond>(
-        self,
-        incoming: A,
-        cond: Cond,
-    ) -> Result<(), BoxError>
-    where
-        // middleware layer constraints
-        L: Layer<CircuitBreakableProxyService<C>> + Sync + Send + 'static,
-        L::Service: Service<
-                ServerContext,
-                (GrpcRequest<Config>, Arc<ConnExtra>),
-                Response = GrpcResponse<GrpcBody>,
-                Error = GrpcStatus,
-            > + Send
-            + 'static,
-
-        // connector constraint
-        C: CircuitBreaker + Clone,
-
-        // circuit breaker condition constraint
-        Cond: Fn(Handler<C::Breakee>, InspectedFuture) -> InspectedFuture + Sync + Send + 'static,
-        T: Send + 'static + RecvEntryMessage,
-        U: Send + 'static + SendEntryMessage,
-    {
-        let mut incoming = incoming.make_incoming().await?;
-        // let custom_layer = self.layer.clone();
-        let cond = Arc::new(cond);
-        while let Some(conn) = incoming.try_next().await? {
-            // let custom_layer = custom_layer.clone();
-            let connector = self.connector.clone();
-            let cond = cond.clone();
-            tokio::spawn(async move {
-                let conn: Conn = conn;
-                let peer_addr = conn.info.peer_addr.clone();
-                let peer_addr = match peer_addr {
-                    Some(Address::Ip(addr)) => Some(PeerAddr(addr)),
-                    _ => None,
-                };
-
-                let mut extra = ConnExtra::default();
-
-                if let Some(peer_addr) = &peer_addr {
-                    extra.insert(peer_addr.clone());
-                }
-                let conn_extra = Arc::new(extra);
-
-                let proxy_service = ServiceBuilder::new()
-                    .layer(RedirectServerHyperAdaptorLayer(conn_extra))
-                    // .layer(custom_layer)
-                    .service(CircuitBreakableProxyService::new(connector, cond));
-
-                let mut server = hyper::server::conn::Http::new();
-                if let Err(err) = server
-                    .http2_max_send_buf_size(4 * 1024 * 1024)
-                    .http2_max_concurrent_streams(1000)
-                    .http2_adaptive_window(true)
-                    .serve_connection(conn, proxy_service)
-                    .await
-                {
-                    tracing::debug!(error=?err, peer=?peer_addr, "[LUST] fail to serve connection");
-                }
-            });
-        }
-        Ok(())
-    }
-
-    pub async fn run<A: volo::net::MakeIncoming>(self, incoming: A) -> Result<(), BoxError>
-    where
-        // middleware layer constraints
-        L: Layer<ProxyService> + Sync + Send + 'static,
-        L::Service: Service<
-                ServerContext,
-                (GrpcRequest<Config>, Arc<ConnExtra>),
-                Response = GrpcResponse<GrpcBody>,
-                Error = GrpcStatus,
-            > + Send
-            + 'static,
-
-        // connector constraints
-        C: GrpcConnector<Conn = GrpcSendRequest> + Clone,
-    {
-        let mut incoming = incoming.make_incoming().await?;
-        let mut connector = self.connector.clone();
-        let custom_layer = Arc::new(self.layer);
-        while let Some(conn) = incoming.try_next().await? {
-            let (send_request, mut extra) = connector.connection_with_extra().await?;
-            let custom_layer = custom_layer.clone();
-            tokio::spawn(async move {
-                let conn: Conn = conn;
-                let peer_addr = conn.info.peer_addr.clone();
-                let peer_addr = match peer_addr {
-                    Some(Address::Ip(addr)) => Some(PeerAddr(addr)),
-                    _ => None,
-                };
-
-                if let Some(peer_addr) = &peer_addr {
-                    extra.insert(peer_addr.clone());
-                }
-                let extra = Arc::new(extra);
-                let proxy_service = ServiceBuilder::new()
-                    .layer(&*custom_layer)
-                    .service(ProxyService::new(send_request));
-
-                let mut server = hyper::server::conn::Http::new();
-                if let Err(err) = server
-                    .http2_max_send_buf_size(4 * 1024 * 1024)
-                    .http2_max_concurrent_streams(1000)
-                    .http2_adaptive_window(true)
-                    .serve_connection(conn, proxy_service)
-                    .await
-                {
-                    tracing::debug!(error=?err, peer=?peer_addr, "[LUST] fail to serve connection");
-                }
-            });
-        }
-        Ok(())
-    }
-}
-
-struct Connection<C> {
-    remote_addr: Option<SocketAddr>,
-    target: Option<Ref<'static, str>>,
-    extra: TypeMap,
-    conn: C,
-}
-
-async fn do_connect<C: CircuitBreaker>(mut c: C) -> Result<Connection<C::Conn>, BoxError> {
-    let (conn, extra) = c.connection_with_extra().await?;
-    let rip = extra.get::<SocketAddr>().cloned();
-    let target = extra.get::<ServiceName>().cloned().map(|t| t.0);
-    Ok(Connection {
-        remote_addr: rip,
-        target,
-        extra,
-        conn,
-    })
-}
-
-struct RedirectServerHyperAdaptorLayer<T, U>(Arc<ConnExtra>, PhantomData<(T, U)>);
-
-impl<T, S, U> Layer<S> for RedirectServerHyperAdaptorLayer<T, U> {
-    type Service = RedirectServerHyperAdaptorService<T, S, U>;
-
-    fn layer(self, inner: S) -> Self::Service {
-        RedirectServerHyperAdaptorService {
-            inner,
-            extra: self.0.clone(),
-            _marker: self.1,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct RedirectServerHyperAdaptorService<T, S, U> {
-    inner: S,
-    extra: Arc<ConnExtra>,
-    _marker: PhantomData<(T, U)>,
-}
-
-macro_rules! trans {
-    ($result:expr) => {
-        match $result {
-            Ok(value) => value,
-            Err(status) => return Ok(status.to_http()),
-        }
-    };
-}
-
-impl<T, S, U> tower::Service<HyperRequest> for RedirectServerHyperAdaptorService<T, S, U>
-where
-    S: Service<
-            ServerContext,
-            (GrpcRequest<T>, Arc<ConnExtra>),
-            Response = volo_grpc::response::Response<U>,
-            Error = GrpcStatus,
-        > + Clone
-        + Send
-        + 'static,
-    T: RecvEntryMessage + Send + Sync,
-    U: SendEntryMessage + Send + Sync,
-{
-    type Response = hyper::Response<GrpcBody>;
-    type Error = anyhow::Error;
-    type Future = BoxFuture<Self::Response, Self::Error>;
-
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        core::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: HyperRequest) -> Self::Future {
-        let mut inner = self.inner.clone();
-
-        Box::pin(async move {
-            let mut cx = ServerContext::default();
-
-            cx.rpc_info.method = Some(req.uri().path().into());
-
-            let (parts, body) = req.into_parts();
-            let body = trans!(T::from_body(
-                cx.rpc_info.method.as_deref(),
-                body,
-                Kind::Request
-            ));
-            let volo_req = volo_grpc::request::Request::from_http_parts(parts, body);
-
-            let volo_resp = trans!(inner.call(&mut cx, (volo_req, self.extra.clone())).await);
-
-            let (mut parts, body) = volo_resp.into_http().into_parts();
-            parts.headers.insert(
-                http::header::CONTENT_TYPE,
-                http::header::HeaderValue::from_static("application/grpc"),
-            );
-            let bytes_stream = body.into_body();
-            Ok(hyper::Response::from_parts(
-                parts,
-                volo_grpc::body::Body::new(bytes_stream),
-            ))
-        })
-    }
-}
-
 #[derive(Clone)]
 pub struct ProxyService {
     sender: GrpcSendRequest,
@@ -368,32 +84,43 @@ impl ProxyService {
     }
 }
 
-impl Service<ServerContext, (GrpcRequest<Config>, Arc<ConnExtra>)> for ProxyService {
-    type Response = GrpcResponse<GrpcBody>;
+impl Service<ServerContext, (Request<Body>, Arc<ConnExtra>)> for ProxyService {
+    type Response = Response<Body>;
 
-    type Error = GrpcStatus;
+    type Error = BoxError;
 
-    type Future<'cx> = BoxFuture<Self::Response, Self::Error>;
+    type Future<'cx> = impl Future<Output = Result<Self::Response, Self::Error>> + Send + 'cx
+    where
+        Self: 'cx;
 
     fn call<'cx, 's>(
         &'s mut self,
-        cx: &'cx mut ServerContext,
-        req: (GrpcRequest<Config>, Arc<ConnExtra>),
+        _cx: &'cx mut ServerContext,
+        (req, _): (Request<Body>, Arc<ConnExtra>),
     ) -> Self::Future<'cx>
     where
         's: 'cx,
     {
         let tx = self.sender.clone();
-        Box::pin(async move {
-            let req: HyperRequest = req.into();
-            let resp = tx.send_request(req).await;
-            let resp = resp.map_err(|err| GrpcStatus::from_error(Box::new(err)))?;
-            let resp: GrpcResponse<GrpcBody> = resp.try_into()?;
-            Ok(resp)
-        })
+        async move {
+            tx.send_request(req)
+                .await
+                .map_err(|err| Box::new(err).into())
+        }
     }
 }
 
+struct Connection<C> {
+    extra: TypeMap,
+    conn: C,
+}
+
+async fn do_connect<C: CircuitBreaker>(mut c: C) -> Result<Connection<C::Conn>, BoxError> {
+    let (conn, extra) = c.connection_with_extra().await?;
+    Ok(Connection { extra, conn })
+}
+
+#[derive(Clone)]
 pub struct CircuitBreakableProxyService<C: CircuitBreaker> {
     connector: C,
     condition: DynCondition<C::Breakee>,
@@ -408,33 +135,35 @@ impl<C: CircuitBreaker> CircuitBreakableProxyService<C> {
     }
 }
 
-impl<C> tower::Service<(GrpcRequest<Config>, Arc<ConnExtra>)> for CircuitBreakableProxyService<C>
+impl<C> Service<ServerContext, (Request<Body>, Arc<ConnExtra>)> for CircuitBreakableProxyService<C>
 where
     C: CircuitBreaker + GrpcConnector<Conn = GrpcSendRequest> + Clone,
 {
-    type Response = GrpcResponse<GrpcBody>;
+    type Response = Response<Body>;
 
-    type Error = GrpcStatus;
+    type Error = volo_grpc::Status;
 
-    type Future = BoxFuture<Self::Response, Self::Error>;
+    type Future<'cx> = impl Future<Output = Result<Self::Response, Self::Error>> + Send + 'cx
+    where
+        Self: 'cx;
 
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        Ok(()).into()
-    }
-
-    fn call(&mut self, (req, _): (GrpcRequest<Config>, Arc<ConnExtra>)) -> Self::Future {
+    fn call<'cx, 's>(
+        &'s mut self,
+        _cx: &'cx mut ServerContext,
+        (req, _): (Request<Body>, Arc<ConnExtra>),
+    ) -> Self::Future<'cx>
+    where
+        's: 'cx,
+    {
         let connector = self.connector.clone();
         let condition = self.condition.clone();
-        Box::pin(async move {
+        async move {
             // TODO: rename do_connect to something like `get_conn` since it doesn't really connect
             // every time, instead it may reuse existing connections.
             let cli_conn = match do_connect(connector).await {
                 Err(err) => {
-                    tracing::warn!(error=?err, "[LUST] fail to connect to upstream");
-                    return Err(GrpcStatus::from_error(err));
+                    tracing::warn!(error=?err, "[VOLO] fail to connect to upstream");
+                    return Err(volo_grpc::Status::from_error(err));
                 }
                 Ok(ret) => ret,
             };
@@ -443,19 +172,249 @@ where
 
             let req: HyperRequest = req.into();
             let f = async move {
-                let resp = tx
+                let resp: Result<http::Response<hyper::Body>, volo_grpc::Status> = tx
                     .send_request(req)
                     .await
-                    .map_err(|err| GrpcStatus::from_error(Box::new(err)))
-                    .and_then(GrpcResponse::<GrpcBody>::try_from);
+                    .map_err(|err| volo_grpc::Status::from_error(Box::new(err)));
                 let resp = resp?;
                 Ok(resp)
             };
             if let Some(handler) = extra.get::<Handler<C::Breakee>>() {
-                condition(handler.clone(), Box::pin(f)).await
+                condition(handler.clone(), Box::pin(f))
+                    .await
+                    .map_err(|err| volo_grpc::Status::from_error(err))
             } else {
-                f.await
+                f.await.map_err(|err| volo_grpc::Status::from_error(err))
             }
-        })
+        }
+    }
+}
+
+pub struct RedirectServer<C, L = Identity> {
+    connector: C,
+    layer: L,
+}
+
+impl<C> RedirectServer<C> {
+    pub fn new(connector: C) -> Self {
+        Self {
+            connector,
+            layer: Identity::new(),
+        }
+    }
+}
+
+impl<C, L> RedirectServer<C, L> {
+    pub fn layer<NL>(self, layer: NL) -> RedirectServer<C, Stack<L, NL>> {
+        RedirectServer {
+            connector: self.connector,
+            layer: Stack::new(self.layer, layer),
+        }
+    }
+
+    pub fn layer_fn<F, Fut>(self, f: F) -> RedirectServer<C, Stack<L, LayerFn<F>>>
+    where
+        F: Fn(
+                (Request<Body>, Arc<ConnExtra>),
+                BoxCloneService<
+                    ServerContext,
+                    (Request<Body>, Arc<ConnExtra>),
+                    Response<Body>,
+                    BoxError,
+                >,
+            ) -> Fut
+            + Clone,
+        Fut: Future<Output = Result<Response<Body>, BoxError>>,
+    {
+        self.layer(layer_fn(f))
+    }
+
+    pub async fn run_with_circuit_breaker<Cond>(
+        self,
+        addr: impl volo::net::MakeIncoming,
+        cond: Cond,
+    ) -> Result<(), BoxError>
+    where
+        L: Layer<CircuitBreakableProxyService<C>> + Sync + Send + Clone + 'static,
+        L::Service: Service<
+                ServerContext,
+                (Request<Body>, Arc<ConnExtra>),
+                Response = Response<Body>,
+                Error = volo_grpc::Status,
+            > + Send
+            + Clone
+            + 'static,
+
+        // connector constraint
+        C: CircuitBreaker + Clone,
+        C: GrpcConnector<Conn = GrpcSendRequest>,
+        C::Breakee: Clone,
+
+        // circuit breaker condition constraint
+        Cond: Fn(Handler<C::Breakee>, InspectedFuture) -> InspectedFuture + Sync + Send + 'static,
+    {
+        let mut incoming = addr.make_incoming().await?;
+        let cond = Arc::new(cond);
+        while let Some(conn) = incoming.try_next().await? {
+            let layer = self.layer.clone();
+            let connector = self.connector.clone();
+            let cond = cond.clone();
+            tokio::spawn(async move {
+                // let conn: Conn = conn;
+                let peer_addr = conn.info.peer_addr.clone();
+                let peer_addr = match peer_addr {
+                    Some(Address::Ip(addr)) => Some(PeerAddr(addr)),
+                    _ => None,
+                };
+
+                let mut extra = ConnExtra::default();
+
+                if let Some(peer_addr) = &peer_addr {
+                    extra.insert(peer_addr.clone());
+                }
+                let conn_extra = Arc::new(extra);
+
+                let proxy_service = ServiceBuilder::new()
+                    .layer(HyperAdaptorLayer::new(conn_extra))
+                    .layer(layer)
+                    .service(CircuitBreakableProxyService::new(connector, cond));
+
+                let mut server = hyper::server::conn::Http::new();
+                if let Err(err) = server
+                    .http2_max_send_buf_size(4 * 1024 * 1024)
+                    .http2_max_concurrent_streams(1000)
+                    .http2_adaptive_window(true)
+                    .serve_connection(conn, proxy_service)
+                    .await
+                {
+                    tracing::debug!(error=?err, peer=?peer_addr, "[VOLO] fail to serve connection");
+                }
+            });
+        }
+        Ok(())
+    }
+
+    // TODO: fix sd update bug
+    pub async fn run<Cond>(self, addr: impl volo::net::MakeIncoming) -> Result<(), BoxError>
+    where
+        L: Layer<ProxyService> + Sync + Send + Clone + 'static,
+        L::Service: Service<
+                ServerContext,
+                (Request<Body>, Arc<ConnExtra>),
+                Response = Response<Body>,
+                Error = volo_grpc::Status,
+            > + Send
+            + Clone
+            + 'static,
+
+        // connector constraint
+        C: CircuitBreaker + Clone,
+        C: GrpcConnector<Conn = GrpcSendRequest>,
+        C::Breakee: Clone,
+
+        // circuit breaker condition constraint
+        Cond: Fn(Handler<C::Breakee>, InspectedFuture) -> InspectedFuture + Sync + Send + 'static,
+    {
+        let mut incoming = addr.make_incoming().await?;
+        while let Some(conn) = incoming.try_next().await? {
+            let layer = self.layer.clone();
+            let mut connector = self.connector.clone();
+            let (send_request, mut extra) = connector.connection_with_extra().await?;
+            tokio::spawn(async move {
+                let peer_addr = conn.info.peer_addr.clone();
+                let peer_addr = match peer_addr {
+                    Some(Address::Ip(addr)) => Some(PeerAddr(addr)),
+                    _ => None,
+                };
+
+                if let Some(peer_addr) = &peer_addr {
+                    extra.insert(peer_addr.clone());
+                }
+                let conn_extra = Arc::new(extra);
+
+                let proxy_service = ServiceBuilder::new()
+                    .layer(HyperAdaptorLayer::new(conn_extra))
+                    .layer(layer)
+                    .service(ProxyService::new(send_request));
+
+                let mut server = hyper::server::conn::Http::new();
+                if let Err(err) = server
+                    .http2_max_send_buf_size(4 * 1024 * 1024)
+                    .http2_max_concurrent_streams(1000)
+                    .http2_adaptive_window(true)
+                    .serve_connection(conn, proxy_service)
+                    .await
+                {
+                    tracing::debug!(error=?err, peer=?peer_addr, "[volo] fail to serve connection");
+                }
+            });
+        }
+        Ok(())
+    }
+}
+
+pub struct HyperAdaptorLayer {
+    extra: Arc<ConnExtra>,
+}
+
+impl HyperAdaptorLayer {
+    pub fn new(extra: Arc<ConnExtra>) -> Self {
+        Self { extra }
+    }
+}
+
+impl<S> Layer<S> for HyperAdaptorLayer {
+    type Service = HyperAdaptorService<S>;
+
+    fn layer(self, inner: S) -> Self::Service {
+        HyperAdaptorService {
+            inner,
+            extra: self.extra.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct HyperAdaptorService<S> {
+    inner: S,
+    extra: Arc<ConnExtra>,
+}
+
+impl<S> tower::Service<hyper::Request<hyper::Body>> for HyperAdaptorService<S>
+where
+    S: Service<
+            ServerContext,
+            (Request<Body>, Arc<ConnExtra>),
+            Response = Response<Body>,
+            Error = volo_grpc::Status,
+        > + Clone
+        + Send
+        + 'static,
+{
+    type Response = hyper::Response<hyper::Body>;
+    type Error = Infallible;
+    type Future = impl Future<Output = Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut ::core::task::Context<'_>,
+    ) -> ::core::task::Poll<Result<(), Self::Error>> {
+        ::core::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: HyperRequest) -> Self::Future {
+        let extra = self.extra.clone();
+        let mut inner = self.inner.clone();
+
+        async move {
+            let mut cx = ServerContext::default();
+            match inner.call(&mut cx, (req, extra)).await {
+                Ok(resp) => Ok(resp),
+                Err(status) => {
+                    let (parts, _) = status.to_http().into_parts();
+                    Ok(hyper::Response::from_parts(parts, hyper::Body::empty()))
+                }
+            }
+        }
     }
 }

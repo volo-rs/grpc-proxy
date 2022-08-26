@@ -9,12 +9,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use http::Response;
+use hyper::Body;
 use index_list::{Index, IndexList};
 use motore::BoxError;
 use tokio::sync::Mutex;
-use volo_grpc::{
-    body::Body as GrpcBody, response::Response as GrpcResponse, status::Status as GrpcStatus,
-};
 
 use crate::{connector::GrpcConnector, BoxFuture, ConnExtra};
 
@@ -24,7 +23,7 @@ const DEFAULT_HALF_OPEN_THRESHOLD: usize = 100;
 const DEFAULT_COOLDOWN_DURATION_SEC: u64 = 100;
 
 pub type InspectedFuture =
-    Pin<Box<dyn Future<Output = Result<GrpcResponse<GrpcBody>, GrpcStatus>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<Response<Body>, BoxError>> + Send + 'static>>;
 pub type DynCondition<C> =
     Arc<dyn Fn(Handler<C>, InspectedFuture) -> InspectedFuture + Send + Sync + 'static>;
 
@@ -99,7 +98,7 @@ where
     }
 
     fn reset(&mut self) -> BoxFuture<(), BoxError> {
-        tracing::trace!("[LUST] reset connector");
+        tracing::trace!("[VOLO] reset connector");
         let inner = self.inner.clone();
         Box::pin(async move {
             inner.lock().await.reset().await?;
@@ -434,7 +433,7 @@ where
         let all_keys: BTreeSet<_> = self.map.keys().cloned().collect();
         let to_remove: Vec<_> = all_keys.difference(&key_set).collect();
         if !to_remove.is_empty() {
-            tracing::trace!(to_remove=?to_remove, "[LUST] remove connectors");
+            tracing::trace!(to_remove=?to_remove, "[VOLO] remove connectors");
             for key in to_remove {
                 if let Some(state) = self.map.remove(key) {
                     self.remove(state.cursor);
@@ -477,7 +476,7 @@ where
         // the key has been removed, ignore it
         if state.is_none() {
             tracing::trace!(
-                "[LUST] circuitbreaker key {:?} has been removed, ignore it",
+                "[VOLO] circuitbreaker key {:?} has been removed, ignore it",
                 key
             );
             return;
@@ -498,7 +497,7 @@ where
         match state.cursor {
             Cursor::Closed(idx) => {
                 if state.dashboard.error_rate() >= self.config.error_rate_threshold {
-                    tracing::trace!(key=?key, "[LUST] move from closed list to open list");
+                    tracing::trace!(key=?key, "[VOLO] move from closed list to open list");
                     if state.cursor == self.current {
                         self.current = next;
                     }
@@ -517,13 +516,13 @@ where
                     if state.dashboard.error_rate() >= self.config.error_rate_threshold {
                         let s = self.half_open_list.remove(idx).expect("must exists");
                         let new_idx = self.open_list.insert_last(s);
-                        tracing::trace!(key=?key, "[LUST] move from halfopen list to open list");
+                        tracing::trace!(key=?key, "[VOLO] move from halfopen list to open list");
                         self.cooldown_stopwatch
                             .insert(Instant::now() + self.config.cooldown_duration, key.clone());
                         state.cursor = Cursor::Open(new_idx);
                     } else {
                         let s = self.half_open_list.remove(idx).expect("must exists");
-                        tracing::trace!(key=?key, "[LUST] move from halfopen list to closed list");
+                        tracing::trace!(key=?key, "[VOLO] move from halfopen list to closed list");
                         let new_idx = self.closed_list.insert_last(s);
                         state.cursor = Cursor::Closed(new_idx);
                         state.dashboard = Dashboard::new(self.config.window_size);
@@ -562,10 +561,10 @@ where
             };
             let mut s = self.open_list.remove(idx).expect("must exists");
             if let Err(err) = s.reset().await {
-                tracing::error!(error=?err, "[LUST] fail to reset circuit breaker inner connector");
+                tracing::error!(error=?err, "[VOLO] fail to reset circuit breaker inner connector");
             }
             let new_idx = self.half_open_list.insert_last(s);
-            tracing::trace!(key=?key, "[LUST] move from open list to halfopen list");
+            tracing::trace!(key=?key, "[VOLO] move from open list to halfopen list");
             state.cursor = Cursor::HalfOpen(new_idx);
             state.dashboard = Dashboard::new(self.config.window_size);
         }
