@@ -23,7 +23,7 @@ jobs:
       - run: exit 0
 
   test-linux:
-    runs-on: [self-hosted, X64]
+    runs-on: [self-hosted, X64, oversea]
 
     steps:
     - uses: actions/checkout@v3
@@ -40,7 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v1
+      # - uses: Swatinem/rust-cache@v1
       - name: Run tests
         run: |
           cargo check
@@ -71,7 +71,7 @@ jobs:
         cargo test
 
   lint:
-    runs-on: [self-hosted, X64]
+    runs-on: [self-hosted, X64, oversea]
 
     steps:
     - uses: actions/checkout@v3
