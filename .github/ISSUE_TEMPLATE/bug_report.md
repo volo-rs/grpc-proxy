@@ -31,13 +31,6 @@ Then:
 Output of `uname -a` (UNIX), or version and 32 or 64-bit (Windows)
 -->
 
-### Crates
-
-<!--
-If known, please specify the affected volo crates. Otherwise, delete this
-section.
--->
-
 ### Description
 
 <!--
