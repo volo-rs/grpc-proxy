@@ -12,8 +12,8 @@ use std::{
 use http::Response;
 use hyper::Body;
 use index_list::{Index, IndexList};
-use motore::BoxError;
 use tokio::sync::Mutex;
+use volo_grpc::status::Status as GrpcStatus;
 
 use crate::{connector::GrpcConnector, BoxFuture, ConnExtra};
 
@@ -23,7 +23,7 @@ const DEFAULT_HALF_OPEN_THRESHOLD: usize = 100;
 const DEFAULT_COOLDOWN_DURATION_SEC: u64 = 100;
 
 pub type InspectedFuture =
-    Pin<Box<dyn Future<Output = Result<Response<Body>, BoxError>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<Response<Body>, GrpcStatus>> + Send + 'static>>;
 pub type DynCondition<C> =
     Arc<dyn Fn(Handler<C>, InspectedFuture) -> InspectedFuture + Send + Sync + 'static>;
 
@@ -78,7 +78,7 @@ where
 {
     type Conn = S::Conn;
 
-    fn connection(&mut self) -> BoxFuture<Self::Conn, BoxError> {
+    fn connection(&mut self) -> BoxFuture<Self::Conn, GrpcStatus> {
         let f = self.create_connection();
         Box::pin(async move {
             let (r, _) = f.await?;
@@ -86,7 +86,7 @@ where
         })
     }
 
-    fn connection_with_extra(&mut self) -> BoxFuture<(Self::Conn, ConnExtra), BoxError> {
+    fn connection_with_extra(&mut self) -> BoxFuture<(Self::Conn, ConnExtra), GrpcStatus> {
         let mut extra = ConnExtra::default();
         let f = self.create_connection();
         Box::pin(async move {
@@ -97,7 +97,7 @@ where
         })
     }
 
-    fn reset(&mut self) -> BoxFuture<(), BoxError> {
+    fn reset(&mut self) -> BoxFuture<(), GrpcStatus> {
         tracing::trace!("[VOLO] reset connector");
         let inner = self.inner.clone();
         Box::pin(async move {
@@ -171,7 +171,7 @@ where
     S: CircuitBreakee + GrpcConnector + Send + 'static,
     S::Key: Clone + Sync + Send + 'static,
 {
-    pub fn create_connection(&self) -> BoxFuture<(S::Conn, Handler<S>), BoxError> {
+    pub fn create_connection(&self) -> BoxFuture<(S::Conn, Handler<S>), GrpcStatus> {
         let inner = self.inner.clone();
         Box::pin(async move {
             let mut m = inner.lock().await;
@@ -314,7 +314,7 @@ struct InstanceState {
 }
 
 impl<S: GrpcConnector + CircuitBreakee> CircuitBreakerInner<S> {
-    async fn reset(&mut self) -> Result<(), BoxError> {
+    async fn reset(&mut self) -> Result<(), GrpcStatus> {
         self.cooldown_stopwatch.clear();
         self.map.clear();
         self.closed_list.append(&mut self.half_open_list);
@@ -384,12 +384,17 @@ impl<S> CircuitBreakerInner<S>
 where
     S: CircuitBreakee + GrpcConnector,
 {
-    async fn create_connection(&mut self) -> Result<(S::Conn, S::Key), BoxError> {
+    async fn create_connection(&mut self) -> Result<(S::Conn, S::Key), GrpcStatus> {
         self.check_cooled().await;
         match self.current {
             Cursor::Closed(idx) => {
                 let service = self.closed_list.get_mut(idx).ok_or_else(|| {
-                    "CircuitBreaker: closed list is empty, but current cursor is closed".to_string()
+                    GrpcStatus::from_error(
+                        String::from(
+                            "CircuitBreaker: closed list is empty, but current cursor is closed",
+                        )
+                        .into(),
+                    )
                 })?;
                 let key = service.key();
                 let conn = service.connection().await?;
@@ -398,8 +403,12 @@ where
             }
             Cursor::HalfOpen(idx) => {
                 let service = self.half_open_list.get_mut(idx).ok_or_else(|| {
-                    "CircuitBreaker: half open list is empty, but current cursor is half open"
-                        .to_string()
+                    GrpcStatus::from_error(
+                        String::from(
+                            "CircuitBreaker: closed list is empty, but current cursor is closed",
+                        )
+                        .into(),
+                    )
                 })?;
                 let key = service.key();
                 let conn = service.connection().await?;
@@ -665,12 +674,12 @@ mod tests {
     impl GrpcConnector for GenSeqNum {
         type Conn = usize;
 
-        fn connection(&mut self) -> BoxFuture<Self::Conn, BoxError> {
+        fn connection(&mut self) -> BoxFuture<Self::Conn, GrpcStatus> {
             let n = self.num;
             Box::pin(async move { Ok(n) })
         }
 
-        fn reset(&mut self) -> BoxFuture<(), BoxError> {
+        fn reset(&mut self) -> BoxFuture<(), GrpcStatus> {
             Box::pin(async move { Ok(()) })
         }
     }
