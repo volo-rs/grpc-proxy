@@ -1,3 +1,4 @@
+pub mod addr_connector;
 pub mod circuit_breaker;
 mod one_to_one_connector;
 

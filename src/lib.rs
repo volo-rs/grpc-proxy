@@ -259,7 +259,6 @@ impl<C, L> RedirectServer<C, L> {
             let connector = self.connector.clone();
             let cond = cond.clone();
             tokio::spawn(async move {
-                // let conn: Conn = conn;
                 let peer_addr = conn.info.peer_addr.clone();
                 let peer_addr = match peer_addr {
                     Some(Address::Ip(addr)) => Some(PeerAddr(addr)),
