@@ -17,7 +17,11 @@ use motore::{
     BoxCloneService, Service,
 };
 use newtype::NewType;
-use volo::{net::Address, util::Ref, Layer};
+use volo::{
+    context::{Context, Endpoint},
+    net::Address,
+    util::Ref,
+};
 use volo_grpc::{context::ServerContext, status::Status as GrpcStatus};
 
 pub type BoxFuture<T, E> = futures::future::BoxFuture<'static, Result<T, E>>;
@@ -112,13 +116,19 @@ impl Service<ServerContext, (Request<Body>, Arc<ConnExtra>)> for ProxyService {
 }
 
 struct Connection<C> {
+    remote_addr: Option<SocketAddr>,
     extra: TypeMap,
     conn: C,
 }
 
 async fn do_connect<C: CircuitBreaker>(mut c: C) -> Result<Connection<C::Conn>, GrpcStatus> {
     let (conn, extra) = c.connection_with_extra().await?;
-    Ok(Connection { extra, conn })
+    let rip = extra.get::<SocketAddr>().cloned();
+    Ok(Connection {
+        remote_addr: rip,
+        extra,
+        conn,
+    })
 }
 
 #[derive(Clone)]
@@ -150,7 +160,7 @@ where
 
     fn call<'cx, 's>(
         &'s mut self,
-        _cx: &'cx mut ServerContext,
+        cx: &'cx mut ServerContext,
         (req, _): (Request<Body>, Arc<ConnExtra>),
     ) -> Self::Future<'cx>
     where
@@ -170,6 +180,13 @@ where
             };
             let extra = cli_conn.extra;
             let tx = cli_conn.conn;
+
+            // we need to set the remote addr here, so that custom layer can read it
+            let mut endpoint = Endpoint::new("unknown-service".into());
+            if let Some(rip) = cli_conn.remote_addr {
+                endpoint.address = Some(Address::Ip(rip));
+            }
+            cx.rpc_info_mut().callee = Some(endpoint);
 
             let req: HyperRequest = req.into();
             let f = async move {
@@ -234,7 +251,7 @@ impl<C, L> RedirectServer<C, L> {
         cond: Cond,
     ) -> Result<(), GrpcStatus>
     where
-        L: Layer<CircuitBreakableProxyService<C>> + Sync + Send + Clone + 'static,
+        L: motore::layer::Layer<CircuitBreakableProxyService<C>> + Sync + Send + Clone + 'static,
         L::Service: Service<
                 ServerContext,
                 (Request<Body>, Arc<ConnExtra>),
@@ -295,7 +312,7 @@ impl<C, L> RedirectServer<C, L> {
     // TODO: fix sd update bug
     pub async fn run<Cond>(self, addr: impl volo::net::MakeIncoming) -> Result<(), GrpcStatus>
     where
-        L: Layer<ProxyService> + Sync + Send + Clone + 'static,
+        L: motore::layer::Layer<ProxyService> + Sync + Send + Clone + 'static,
         L::Service: Service<
                 ServerContext,
                 (Request<Body>, Arc<ConnExtra>),
@@ -361,7 +378,7 @@ impl HyperAdaptorLayer {
     }
 }
 
-impl<S> Layer<S> for HyperAdaptorLayer {
+impl<S> motore::layer::Layer<S> for HyperAdaptorLayer {
     type Service = HyperAdaptorService<S>;
 
     fn layer(self, inner: S) -> Self::Service {
