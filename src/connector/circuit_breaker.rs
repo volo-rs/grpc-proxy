@@ -391,7 +391,7 @@ where
                 let service = self.closed_list.get_mut(idx).ok_or_else(|| {
                     GrpcStatus::from_error(
                         String::from(
-                            "CircuitBreaker: closed list is empty, but current cursor is closed",
+                            "CircuitBreaker: closed list is empty, there is no available instance",
                         )
                         .into(),
                     )
@@ -405,7 +405,7 @@ where
                 let service = self.half_open_list.get_mut(idx).ok_or_else(|| {
                     GrpcStatus::from_error(
                         String::from(
-                            "CircuitBreaker: closed list is empty, but current cursor is closed",
+                            "CircuitBreaker: closed list is empty, there is no available instance",
                         )
                         .into(),
                     )
