@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use motore::BoxError;
+use volo_grpc::status::Status as GrpcStatus;
 
 use crate::{connector::GrpcConnector, BoxFuture, CircuitBreakee, GrpcSendRequest};
 
@@ -30,7 +30,7 @@ impl OneToOneConnector {
 impl GrpcConnector for OneToOneConnector {
     type Conn = GrpcSendRequest;
 
-    fn connection(&mut self) -> BoxFuture<Self::Conn, BoxError> {
+    fn connection(&mut self) -> BoxFuture<Self::Conn, GrpcStatus> {
         let addr = self.addr();
         Box::pin(async move {
             let new_sender = GrpcSendRequest::new(addr);
@@ -38,7 +38,7 @@ impl GrpcConnector for OneToOneConnector {
         })
     }
 
-    fn reset(&mut self) -> BoxFuture<(), BoxError> {
+    fn reset(&mut self) -> BoxFuture<(), GrpcStatus> {
         Box::pin(async move { Ok(()) })
     }
 }

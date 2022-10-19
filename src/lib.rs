@@ -1,4 +1,3 @@
-#![feature(generic_associated_types)]
 #![feature(type_alias_impl_trait)]
 
 pub mod connector;
@@ -14,13 +13,18 @@ use metainfo::TypeMap;
 use motore::{
     builder::ServiceBuilder,
     layer::{layer_fn, Identity, LayerFn, Stack},
-    BoxCloneService, BoxError, Service,
+    BoxCloneService, Service,
 };
 use newtype::NewType;
-use volo::{net::Address, util::Ref, Layer};
-use volo_grpc::context::ServerContext;
+use volo::{
+    context::{Context, Endpoint},
+    net::Address,
+    util::Ref,
+};
+use volo_grpc::{context::ServerContext, status::Status as GrpcStatus};
 
 pub type BoxFuture<T, E> = futures::future::BoxFuture<'static, Result<T, E>>;
+pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub type ConnExtra = TypeMap;
 pub type HyperRequest = hyper::Request<hyper::Body>;
 pub type HyperResponse = hyper::Response<hyper::Body>;
@@ -87,7 +91,7 @@ impl ProxyService {
 impl Service<ServerContext, (Request<Body>, Arc<ConnExtra>)> for ProxyService {
     type Response = Response<Body>;
 
-    type Error = BoxError;
+    type Error = GrpcStatus;
 
     type Future<'cx> = impl Future<Output = Result<Self::Response, Self::Error>> + Send + 'cx
     where
@@ -105,19 +109,25 @@ impl Service<ServerContext, (Request<Body>, Arc<ConnExtra>)> for ProxyService {
         async move {
             tx.send_request(req)
                 .await
-                .map_err(|err| Box::new(err).into())
+                .map_err(|err| GrpcStatus::from_error(Box::new(err)))
         }
     }
 }
 
 struct Connection<C> {
+    remote_addr: Option<SocketAddr>,
     extra: TypeMap,
     conn: C,
 }
 
-async fn do_connect<C: CircuitBreaker>(mut c: C) -> Result<Connection<C::Conn>, BoxError> {
+async fn do_connect<C: CircuitBreaker>(mut c: C) -> Result<Connection<C::Conn>, GrpcStatus> {
     let (conn, extra) = c.connection_with_extra().await?;
-    Ok(Connection { extra, conn })
+    let rip = extra.get::<SocketAddr>().cloned();
+    Ok(Connection {
+        remote_addr: rip,
+        extra,
+        conn,
+    })
 }
 
 #[derive(Clone)]
@@ -149,7 +159,7 @@ where
 
     fn call<'cx, 's>(
         &'s mut self,
-        _cx: &'cx mut ServerContext,
+        cx: &'cx mut ServerContext,
         (req, _): (Request<Body>, Arc<ConnExtra>),
     ) -> Self::Future<'cx>
     where
@@ -163,12 +173,19 @@ where
             let cli_conn = match do_connect(connector).await {
                 Err(err) => {
                     tracing::warn!(error=?err, "[VOLO] fail to connect to upstream");
-                    return Err(volo_grpc::Status::from_error(err));
+                    return Err(err);
                 }
                 Ok(ret) => ret,
             };
             let extra = cli_conn.extra;
             let tx = cli_conn.conn;
+
+            // we need to set the remote addr here, so that custom layer can read it
+            let mut endpoint = Endpoint::new("unknown-service".into());
+            if let Some(rip) = cli_conn.remote_addr {
+                endpoint.address = Some(Address::Ip(rip));
+            }
+            cx.rpc_info_mut().callee = Some(endpoint);
 
             let req: HyperRequest = req.into();
             let f = async move {
@@ -180,11 +197,9 @@ where
                 Ok(resp)
             };
             if let Some(handler) = extra.get::<Handler<C::Breakee>>() {
-                condition(handler.clone(), Box::pin(f))
-                    .await
-                    .map_err(|err| volo_grpc::Status::from_error(err))
+                condition(handler.clone(), Box::pin(f)).await
             } else {
-                f.await.map_err(|err| volo_grpc::Status::from_error(err))
+                f.await
             }
         }
     }
@@ -220,11 +235,11 @@ impl<C, L> RedirectServer<C, L> {
                     ServerContext,
                     (Request<Body>, Arc<ConnExtra>),
                     Response<Body>,
-                    BoxError,
+                    GrpcStatus,
                 >,
             ) -> Fut
             + Clone,
-        Fut: Future<Output = Result<Response<Body>, BoxError>>,
+        Fut: Future<Output = Result<Response<Body>, GrpcStatus>>,
     {
         self.layer(layer_fn(f))
     }
@@ -233,9 +248,9 @@ impl<C, L> RedirectServer<C, L> {
         self,
         addr: impl volo::net::MakeIncoming,
         cond: Cond,
-    ) -> Result<(), BoxError>
+    ) -> Result<(), GrpcStatus>
     where
-        L: Layer<CircuitBreakableProxyService<C>> + Sync + Send + Clone + 'static,
+        L: motore::layer::Layer<CircuitBreakableProxyService<C>> + Sync + Send + Clone + 'static,
         L::Service: Service<
                 ServerContext,
                 (Request<Body>, Arc<ConnExtra>),
@@ -260,7 +275,6 @@ impl<C, L> RedirectServer<C, L> {
             let connector = self.connector.clone();
             let cond = cond.clone();
             tokio::spawn(async move {
-                // let conn: Conn = conn;
                 let peer_addr = conn.info.peer_addr.clone();
                 let peer_addr = match peer_addr {
                     Some(Address::Ip(addr)) => Some(PeerAddr(addr)),
@@ -295,9 +309,9 @@ impl<C, L> RedirectServer<C, L> {
     }
 
     // TODO: fix sd update bug
-    pub async fn run<Cond>(self, addr: impl volo::net::MakeIncoming) -> Result<(), BoxError>
+    pub async fn run<Cond>(self, addr: impl volo::net::MakeIncoming) -> Result<(), GrpcStatus>
     where
-        L: Layer<ProxyService> + Sync + Send + Clone + 'static,
+        L: motore::layer::Layer<ProxyService> + Sync + Send + Clone + 'static,
         L::Service: Service<
                 ServerContext,
                 (Request<Body>, Arc<ConnExtra>),
@@ -363,7 +377,7 @@ impl HyperAdaptorLayer {
     }
 }
 
-impl<S> Layer<S> for HyperAdaptorLayer {
+impl<S> motore::layer::Layer<S> for HyperAdaptorLayer {
     type Service = HyperAdaptorService<S>;
 
     fn layer(self, inner: S) -> Self::Service {

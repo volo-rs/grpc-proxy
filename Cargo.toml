@@ -12,11 +12,11 @@ http = "0.2.8"
 hyper = { version = "0.14.20", features = ["full"] }
 index_list = "0.2.7"
 metainfo = "0.6.2"
-motore = "0.1.0"
+motore = "0.2"
 newtype = "0.2.1"
 tokio = { version = "1.20.1", features = ["sync", "net"] }
 tower = "0.4.13"
 tower-layer = "0.3.1"
 tracing = "0.1.36"
-volo = { git = "https://github.com/cloudwego/volo.git", package = "volo" }
-volo-grpc = { git = "https://github.com/cloudwego/volo.git", package = "volo-grpc" }
+volo = "0.2"
+volo-grpc = "0.2"
