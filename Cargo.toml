@@ -1,22 +1,28 @@
 [package]
 name = "grpc-proxy"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
+description = "grpc proxy"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+authors = ["Volo Team <volo@cloudwego.io>"]
+homepage = "https://www.cloudwego.io/docs/volo/"
+repository = "https://github.com/volo-rs/grpc-proxy"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.62"
-futures = "0.3.23"
-http = "0.2.8"
-hyper = { version = "0.14.20", features = ["full"] }
-index_list = "0.2.7"
-metainfo = "0.6.2"
-motore = "0.2"
-newtype = "0.2.1"
-tokio = { version = "1.20.1", features = ["sync", "net"] }
-tower = "0.4.13"
-tower-layer = "0.3.1"
-tracing = "0.1.36"
-volo = "0.2"
-volo-grpc = "0.2"
+anyhow = "=1.0.62"
+futures = "=0.3.23"
+http = "=0.2.8"
+hyper = { version = "=0.14.20", features = ["full"] }
+index_list = "=0.2.7"
+metainfo = "=0.6.2"
+motore = "=0.2.1"
+newtype = "=0.2.1"
+tokio = { version = "=1.20.1", features = ["sync", "net"] }
+tower = "=0.4.13"
+tower-layer = "=0.3.1"
+tracing = "=0.1.36"
+volo = "=0.2.1"
+volo-grpc = "=0.2.1"
